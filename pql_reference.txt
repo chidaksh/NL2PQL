@@ -1,0 +1,354 @@
+================================================================================
+PREDICTIVE QUERY LANGUAGE (PQL) — COMPLETE REFERENCE FOR LLM PROMPTING
+================================================================================
+
+Source: Compiled from official Kumo documentation, KumoRFM paper, SDK docs,
+        GitHub notebooks, and Snowflake quickstart. Verified Feb 2026.
+
+================================================================================
+SECTION 1: OVERVIEW
+================================================================================
+
+PQL (Predictive Query Language) is a declarative, SQL-like syntax created by
+Kumo AI for defining machine learning prediction tasks in a single statement.
+Unlike SQL (which manipulates existing data), PQL defines WHAT to predict
+and WHO to predict for, and the KumoRFM model handles the rest.
+
+PQL is MUCH simpler than SQL:
+- No JOINs, no GROUP BY, no subqueries, no CTEs, no SELECT
+- ~4-5 structural patterns total
+- The system infers the ML task type automatically from the query structure
+
+================================================================================
+SECTION 2: CORE SYNTAX (KumoRFM — Free API)
+================================================================================
+
+CRITICAL DISTINCTION:
+- KumoRFM (free API): Uses  FOR entity.id = value  or  FOR entity.id IN (v1, v2)
+- Kumo Enterprise:    Uses  FOR EACH entity.id  (batch prediction for all entities)
+- KumoRFM is NOT a batch processor. Always specify individual entity IDs.
+
+Basic structure:
+```
+PREDICT <target>
+FOR <entity_table>.<entity_id_column> = <value>
+[WHERE <filter>]
+```
+
+Or with multiple entities:
+```
+PREDICT <target>
+FOR <entity_table>.<entity_id_column> IN (<val1>, <val2>, ...)
+[WHERE <filter>]
+```
+
+Components:
+- PREDICT: Declares the target — the value/outcome to predict
+- FOR:     Specifies the entity (who/what to predict for) with explicit IDs
+- WHERE:   (Optional) Filters historical context data used for features
+           Does NOT limit which entities are predicted for
+
+================================================================================
+SECTION 3: TARGET TYPES (What You Can Predict)
+================================================================================
+
+There are TWO categories of targets:
+
+A) STATIC FIELD (Missing Value Imputation)
+   Pattern:  PREDICT <table>.<column>
+   Example:  PREDICT users.age FOR users.user_id=8
+   Task:     Regression (if numeric) or Classification (if categorical)
+   Use when: Predicting a missing attribute of an entity
+
+B) TIME-BASED AGGREGATION (Temporal Prediction)
+   Pattern:  PREDICT AGG(<table>.<column>, <start>, <end>[, <unit>])
+   Example:  PREDICT SUM(orders.price, 0, 30, days) FOR users.user_id=123
+   Task:     Depends on aggregation + comparison operator (see Section 5)
+   Use when: Predicting something about future behavior over a time window
+
+================================================================================
+SECTION 4: AGGREGATION FUNCTIONS
+================================================================================
+
+Function         | Description                    | Target Column Type | Example
+-----------------+--------------------------------+--------------------+------------------------------------------
+SUM              | Sum of numeric values           | numeric            | SUM(orders.price, 0, 30)
+COUNT            | Count of rows                   | * (any) or column  | COUNT(orders.*, 0, 90, days)
+AVG              | Average of numeric values        | numeric            | AVG(reviews.is_recommended, 0, 12, months)
+MAX              | Maximum numeric value            | numeric            | MAX(orders.price, 0, 30, days)
+MIN              | Minimum numeric value            | numeric            | MIN(orders.price, 0, 7)
+COUNT_DISTINCT   | Count of unique values           | any                | COUNT_DISTINCT(purchases.item, 0, 90)
+LIST_DISTINCT    | List of unique values (for recs) | categorical/FK     | LIST_DISTINCT(orders.item_id, 0, 30, days)
+FIRST            | First occurring value            | any                | FIRST(purchase.type, 0, 7)
+
+Aggregation arguments: AGG(<table>.<column>, <start>, <end>[, <unit>])
+- <start>: Start of time window (inclusive lower bound)
+- <end>:   End of time window (inclusive upper bound)
+- <unit>:  Optional. One of: days (default), hours, months
+- start and end are relative to prediction time (anchor time)
+
+Time window examples:
+- (0, 30):       Next 30 days from now
+- (0, 30, days): Same as above (explicit unit)
+- (0, 12, months): Next 12 months
+- (0, 24, hours):  Next 24 hours
+- (-90, 0):      Past 90 days (used in WHERE clauses)
+- (-30, 30):     30 days before to 30 days after
+- (10, 30):      Day 10 to day 30 from now (skipping first 10 days)
+
+RULES:
+- For PREDICT targets: both start and end must be >= 0 (future only)
+- For WHERE filters: start can be negative (past), end is typically 0
+- end must be > start
+
+================================================================================
+SECTION 5: TASK TYPE DETECTION (Automatic)
+================================================================================
+
+KumoRFM automatically infers the ML task from the PREDICT clause:
+
+Pattern                                  | Task Type               | Metrics
+-----------------------------------------+-------------------------+-----------
+Raw numeric column (e.g. users.age)      | Regression              | MAE, RMSE
+Numeric aggregation (SUM, AVG, MAX, MIN) | Regression              | MAE, RMSE
+AGG(...) = 0  or  AGG(...) > 0           | Binary Classification   | AUC, F1, AUPRC, AUROC
+Categorical column                       | Multiclass/Multilabel   | Accuracy, Top-k
+Boolean expression (col = value)         | Binary Classification   | AUC, F1
+FIRST(...) on categorical column         | Multiclass              | Accuracy
+LIST_DISTINCT(...) RANK TOP k            | Link Prediction/Ranking | Recall@k, MRR
+
+Key insight: Adding "= 0", "> 0", "= 1" etc. to an aggregation CHANGES the
+task type from regression to binary classification. This is the primary mechanism
+for turning numeric aggregations into yes/no predictions.
+
+================================================================================
+SECTION 6: BOOLEAN & COMPARISON OPERATORS
+================================================================================
+
+Available operators for targets and WHERE clauses:
+
+Comparison:  =   !=   <   <=   >   >=
+Logical:     AND   OR   NOT
+Set:         IN   CONTAINS   STARTS WITH   ENDS WITH
+Pattern:     LIKE   NOT LIKE
+Null check:  IS NULL   IS NOT NULL
+
+Examples in targets:
+- PREDICT COUNT(orders.*, 0, 30) = 0          → churn (binary classification)
+- PREDICT COUNT(orders.*, 0, 7) > 0           → activity prediction (binary)
+- PREDICT customer_item_pairs.likes = 1       → like probability (binary)
+
+Examples in WHERE:
+- WHERE COUNT(transactions.*, -60, 0, days) > 0    → only active customers
+- WHERE transaction.type = "bank transfer"          → static filter on column value
+- WHERE COUNT(reviews.*, -12, 0, months) > 0        → only items with recent reviews
+
+================================================================================
+SECTION 7: LINK PREDICTION (Recommendations)
+================================================================================
+
+Pattern:
+```
+PREDICT LIST_DISTINCT(<event_table>.<target_column>, <start>, <end>[, <unit>]) RANK TOP <k>
+FOR <entity_table>.<entity_id> = <value>
+```
+
+This predicts the top-k distinct values of <target_column> that the entity will
+interact with in the given time window. Used for recommendation systems.
+
+Examples:
+- Product recommendations:
+  PREDICT LIST_DISTINCT(orders.item_id, 0, 30, days) RANK TOP 10
+  FOR users.user_id=123
+
+- Game recommendations:
+  PREDICT LIST_DISTINCT(reviews.app_id, 0, 12, months) RANK TOP 3
+  FOR users.user_id=11764552
+
+- Item similarity (Enterprise only, static):
+  PREDICT LIST_DISTINCT(copurchase.dst_item_id) RANK TOP 10
+  FOR EACH src_item.item_id
+
+Note: Static link prediction (no time window) is NOT supported in KumoRFM free tier.
+
+================================================================================
+SECTION 8: EVALUATE MODE
+================================================================================
+
+Prepend EVALUATE to any PREDICT query to get evaluation metrics instead of
+predictions. Returns metrics appropriate to the task type:
+- Binary classification: AUPRC, AUROC
+- Regression: MAE, RMSE
+- Link prediction: Recall@k, MRR
+
+Pattern:
+```
+EVALUATE PREDICT <target>
+FOR <entity_table>.<entity_id> IN (<val1>, <val2>, ...)
+```
+
+Examples:
+- EVALUATE PREDICT COUNT(orders.*, 0, 30, days) = 0
+  FOR users.user_id IN (1, 2, 3, 4, 5)
+
+- EVALUATE PREDICT LIST_DISTINCT(orders.item_id, 0, 90, days) RANK TOP 10
+  FOR users.user_id=123
+
+================================================================================
+SECTION 9: DATA EXPLORATION COMMANDS (KumoRFM)
+================================================================================
+
+SHOW TABLES
+  → Lists all available tables in the current graph
+
+SHOW <table_name>
+  → Shows a random 5-row sample of the specified table
+
+These are utility commands, not prediction queries.
+
+================================================================================
+SECTION 10: KumoRFM API USAGE
+================================================================================
+
+Python SDK:
+```python
+import kumoai.experimental.rfm as rfm
+import os, pandas as pd
+
+os.environ["KUMO_API_KEY"] = "YOUR_KEY"
+rfm.init()
+
+# Load data
+dataset_url = "s3://kumo-sdk-public/rfm-datasets/online-shopping"
+users_df = pd.read_parquet(f"{dataset_url}/users.parquet")
+items_df = pd.read_parquet(f"{dataset_url}/items.parquet")
+orders_df = pd.read_parquet(f"{dataset_url}/orders.parquet")
+
+# Build graph (auto-infers links, types, keys)
+graph = rfm.LocalGraph.from_data({
+    "users": users_df, "items": items_df, "orders": orders_df,
+})
+
+# Make predictions
+model = rfm.KumoRFM(graph)
+result = model.predict("PREDICT SUM(orders.price, 0, 30, days) FOR items.item_id=1")
+
+# Evaluate
+metrics = model.evaluate("EVALUATE PREDICT COUNT(orders.*, 0, 30, days) = 0 FOR users.user_id IN (1, 2, 3)")
+
+# Optional parameters for predict():
+# anchor_time: pd.Timestamp — the reference time for predictions
+# num_hops: int — number of graph hops for context (default varies)
+```
+
+Rate limits: 1000 queries/day on free tier.
+Graph constraints: <500M rows recommended for reasonable response time.
+
+================================================================================
+SECTION 11: KumoRFM LIMITATIONS vs ENTERPRISE
+================================================================================
+
+KumoRFM (free API) does NOT support:
+1. FOR EACH <entity> (batch predictions for all entities)
+   → Use: FOR entity.id = value  or  FOR entity.id IN (list)
+
+2. 2-hop target filters
+   → e.g., LIST_DISTINCT(orders.item_id WHERE items.category = "electronics", 0, 7)
+   → NOT SUPPORTED in KumoRFM
+
+3. 1-hop static targets across different tables
+   → e.g., PREDICT customer_info.AGE FOR customer.ID
+   → NOT SUPPORTED (but same-table imputation IS supported:
+     PREDICT users.age FOR users.user_id=8)
+
+4. Static link prediction (LIST_DISTINCT without time window)
+   → NOT SUPPORTED in KumoRFM
+
+5. ASSUMING clause (hypothetical scenarios)
+   → Enterprise-only feature
+
+================================================================================
+SECTION 12: KNOWN DATASETS FOR KumoRFM
+================================================================================
+
+A) Online Shopping (Default quickstart)
+   URL: s3://kumo-sdk-public/rfm-datasets/online-shopping
+   Tables:
+   - users:  user_id (PK, int), age (int), gender (str)
+   - items:  item_id (PK, int), category (str), price (float)
+   - orders: order_id (PK, int), user_id (FK→users), item_id (FK→items),
+             price (float), timestamp (datetime, TIME COLUMN)
+   Links: orders.user_id → users.user_id, orders.item_id → items.item_id
+
+B) Steam Games (PQL tutorial)
+   URL: s3://kumo-sdk-public/rfm-datasets/steam
+   Tables:
+   - games:   app_id (PK), title (str)
+   - users:   user_id (PK)
+   - reviews: review_id (PK), app_id (FK→games), user_id (FK→users),
+              is_recommended (numeric/bool), timestamp (datetime, TIME COLUMN)
+   Links: reviews.app_id → games.app_id, reviews.user_id → users.user_id
+
+C) Customer LTV Mini (SDK introduction)
+   URL: s3://kumo-public-datasets/customerltv_mini/
+   Tables:
+   - customer:    CustomerID (PK)
+   - stock:       StockCode (PK), Description (str)
+   - transaction: InvoiceNo, StockCode (FK), Quantity (int),
+                  InvoiceDate (TIME COLUMN), UnitPrice (float),
+                  CustomerID (FK→customer)
+
+D) F1 Racing (Handbook — RelBench)
+   Tables: drivers, results, standings, races, circuits, constructors
+   (Complex multi-table schema used in handbook.ipynb for advanced examples)
+
+================================================================================
+SECTION 13: QUERY CONSTRUCTION RULES (FOR LLM GENERATION)
+================================================================================
+
+When generating PQL queries, follow these rules STRICTLY:
+
+1. ONLY reference tables that exist in the graph
+2. ONLY reference columns that exist in the referenced table
+3. Use the EXACT table and column names (case-sensitive in some deployments)
+4. Entity IDs in FOR clause must be actual IDs from the data
+5. For numeric predictions: use SUM, AVG, MAX, MIN, COUNT on numeric columns
+6. For churn/activity: use COUNT(<table>.*, ...) = 0 or > 0
+7. For recommendations: use LIST_DISTINCT(<table>.<fk_column>, ...) RANK TOP k
+8. For imputation: use PREDICT <table>.<column> (no aggregation, no time window)
+9. Time windows: start >= 0 for PREDICT targets; start can be < 0 for WHERE
+10. Always use existing primary key columns in FOR clause
+11. SUM/AVG/MAX/MIN require numeric columns — do NOT apply to categorical
+12. COUNT can use * (wildcard) for counting any rows
+13. LIST_DISTINCT target column should be a foreign key or categorical column
+14. WHERE clause filters context, NOT the entity list
+
+Common mistakes to AVOID:
+- Using SUM on a string/categorical column
+- Using FOR EACH (enterprise-only) instead of FOR entity IN (ids)
+- Referencing columns from the wrong table
+- Using negative start values in PREDICT target (only allowed in WHERE)
+- Omitting RANK TOP k when using LIST_DISTINCT
+- Using time windows with imputation queries (imputation has no time component)
+
+================================================================================
+SECTION 14: INTENT-TO-PQL MAPPING TABLE
+================================================================================
+
+Business Intent         | PQL Pattern                                              | Task Type
+------------------------+----------------------------------------------------------+------------------
+Customer churn          | PREDICT COUNT(events.*, 0, N, days) = 0 FOR entity      | Binary classif.
+Will-they-buy/engage    | PREDICT COUNT(events.*, 0, N, days) > 0 FOR entity      | Binary classif.
+Revenue/LTV forecast    | PREDICT SUM(events.amount, 0, N, days) FOR entity       | Regression
+Average metric forecast | PREDICT AVG(events.metric, 0, N, unit) FOR entity       | Regression
+Max value forecast      | PREDICT MAX(events.value, 0, N, days) FOR entity        | Regression
+Product recommendation  | PREDICT LIST_DISTINCT(events.item_col, 0, N) RANK TOP k | Link prediction
+Missing attribute       | PREDICT entity_table.column FOR entity_table.id=val     | Regression/Classif.
+Fraud detection         | PREDICT labels.is_fraud FOR events.id=val               | Binary classif.
+Return prediction       | PREDICT COUNT(returns.*, 0, N, days) > 0 FOR order.id   | Binary classif.
+Engagement rate         | PREDICT AVG(reviews.is_recommended, 0, N, months) FOR e | Regression
+Evaluation              | EVALUATE PREDICT <any above> FOR entity IN (ids)         | Same as inner query
+
+================================================================================
+END OF REFERENCE
+================================================================================

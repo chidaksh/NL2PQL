@@ -1,9 +1,11 @@
 """
 LangGraph orchestration for PredictiveAgent.
 
-4-node pipeline:
-  Schema Discovery → Hypothesis Generation → Prediction Execution → Strategy Synthesis
-Explainability is handled natively via model.predict(query, explain=True).
+5-node query-first pipeline:
+  Table Inspection → Hypothesis Generation → Graph Building → Prediction Execution → Strategy Synthesis
+
+The graph is built AFTER PQL queries are generated, so that entity-target
+links can be created (via denormalization) to satisfy PQL's direct-link requirement.
 """
 
 from __future__ import annotations
@@ -18,19 +20,23 @@ class AgentState(TypedDict):
     # Input
     question: str
     data_path: str
-    table_names: list[str] | None  # required for S3 paths
-    anchor_time: str | None  # optional historical anchor (e.g. "2024-09-01")
+    table_names: list[str] | None
+    anchor_time: str | None
 
-    # Schema Discovery
+    # Table Inspection
     tables: dict[str, Any]
-    graph_schema: dict[str, Any]
-    graph_built: bool
+    raw_tables: dict[str, Any]
     llm_schema: dict[str, Any]
+    tables_loaded: bool
 
     # Hypothesis Generator
     hypotheses: list[dict[str, str]]
 
-    # Prediction Executor (includes explanations via explain=True)
+    # Graph Builder
+    graph_schema: dict[str, Any]
+    graph_built: bool
+
+    # Prediction Executor
     predictions: Annotated[list[dict[str, Any]], operator.add]
 
     # Strategy Synthesizer
@@ -42,15 +48,28 @@ class AgentState(TypedDict):
     current_step: str
 
 
-from agents.schema_discovery import discover_schema
+from agents.schema_discovery import inspect_tables
 from agents.hypothesis_generator import generate_hypotheses
+from agents.graph_builder import build_query_graph
 from agents.prediction_executor import execute_predictions
 from agents.strategy_synthesizer import synthesize_strategy
 
 
-def should_continue_after_schema(state: AgentState) -> str:
-    if state.get("graph_built"):
+def should_continue_after_inspect(state: AgentState) -> str:
+    if state.get("tables_loaded"):
         return "generate_hypotheses"
+    return "end_with_error"
+
+
+def should_continue_after_hypotheses(state: AgentState) -> str:
+    if state.get("hypotheses"):
+        return "build_query_graph"
+    return "end_with_error"
+
+
+def should_continue_after_graph(state: AgentState) -> str:
+    if state.get("graph_built"):
+        return "execute_predictions"
     return "end_with_error"
 
 
@@ -73,20 +92,30 @@ def end_with_error(state: AgentState) -> dict:
 def build_agent_graph() -> StateGraph:
     workflow = StateGraph(AgentState)
 
-    workflow.add_node("discover_schema", discover_schema)
+    workflow.add_node("inspect_tables", inspect_tables)
     workflow.add_node("generate_hypotheses", generate_hypotheses)
+    workflow.add_node("build_query_graph", build_query_graph)
     workflow.add_node("execute_predictions", execute_predictions)
     workflow.add_node("synthesize_strategy", synthesize_strategy)
     workflow.add_node("end_with_error", end_with_error)
 
-    workflow.set_entry_point("discover_schema")
+    workflow.set_entry_point("inspect_tables")
 
     workflow.add_conditional_edges(
-        "discover_schema",
-        should_continue_after_schema,
+        "inspect_tables",
+        should_continue_after_inspect,
         {"generate_hypotheses": "generate_hypotheses", "end_with_error": "end_with_error"},
     )
-    workflow.add_edge("generate_hypotheses", "execute_predictions")
+    workflow.add_conditional_edges(
+        "generate_hypotheses",
+        should_continue_after_hypotheses,
+        {"build_query_graph": "build_query_graph", "end_with_error": "end_with_error"},
+    )
+    workflow.add_conditional_edges(
+        "build_query_graph",
+        should_continue_after_graph,
+        {"execute_predictions": "execute_predictions", "end_with_error": "end_with_error"},
+    )
     workflow.add_conditional_edges(
         "execute_predictions",
         should_continue_after_predictions,
@@ -119,10 +148,12 @@ def run_predictive_agent(
         "table_names": table_names,
         "anchor_time": anchor_time,
         "tables": {},
+        "raw_tables": {},
+        "llm_schema": {},
+        "tables_loaded": False,
+        "hypotheses": [],
         "graph_schema": {},
         "graph_built": False,
-        "llm_schema": {},
-        "hypotheses": [],
         "predictions": [],
         "strategy_report": "",
         "confidence_score": 0.0,

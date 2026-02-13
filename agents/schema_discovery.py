@@ -1,8 +1,9 @@
 """
-Schema Discovery Agent.
+Table Inspection Agent.
 
-Inspects data files, uses LLM reasoning to infer the relational schema
-(primary keys, time columns, foreign key links), and builds a KumoRFM graph.
+Inspects data files and uses LLM reasoning to infer the relational schema
+(primary keys, time columns, foreign key links). Does NOT build the graph —
+that is deferred to the query-driven graph builder.
 """
 
 from __future__ import annotations
@@ -13,12 +14,69 @@ from typing import Any
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from tools.kumo_tools import (
-    load_tables, build_graph, build_graph_with_schema, get_graph_info, ensure_init,
-)
+from tools.kumo_tools import load_tables, ensure_init, get_semantic_types
 from tools.llm import get_llm
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_schema_conflicts(schema: dict, raw_tables: dict) -> dict:
+    """
+    Fix schema conflicts that would cause KumoRFM to reject the graph:
+    1. PK/FK conflict: column is both PK and FK on the same table
+    2. PK/time conflict: column is both PK and time_column on the same table
+    """
+    table_configs = schema.get("tables", {})
+    links = schema.get("links", [])
+
+    # --- PK/FK conflicts ---
+    fk_cols_by_table: dict[str, set[str]] = {}
+    for link in links:
+        src = link.get("src_table")
+        fkey = link.get("fkey")
+        if src and fkey:
+            fk_cols_by_table.setdefault(src, set()).add(fkey)
+
+    for tname, tconf in table_configs.items():
+        pk = tconf.get("primary_key")
+        if not pk or pk not in fk_cols_by_table.get(tname, set()):
+            continue
+
+        logger.warning(f"  PK/FK conflict in {tname}: '{pk}' is both PK and FK")
+
+        df = raw_tables.get(tname)
+        if df is None:
+            tconf["primary_key"] = None
+            logger.warning(f"  No DataFrame for {tname}, setting PK to None")
+            continue
+
+        all_fks = fk_cols_by_table.get(tname, set())
+        time_col = tconf.get("time_column")
+        best_alt = None
+        for col in df.columns:
+            if col == pk or col in all_fks or col == time_col:
+                continue
+            if df[col].nunique() == len(df) and df[col].notna().all():
+                best_alt = col
+                break
+
+        if best_alt:
+            tconf["primary_key"] = best_alt
+            logger.info(f"  Resolved: {tname} PK changed from '{pk}' to '{best_alt}'")
+        else:
+            tconf["primary_key"] = None
+            logger.info(f"  No alternative PK found for {tname}, setting PK to None")
+
+    # --- PK/time conflicts ---
+    for tname, tconf in table_configs.items():
+        pk = tconf.get("primary_key")
+        time_col = tconf.get("time_column")
+        if pk and time_col and pk == time_col:
+            logger.warning(f"  PK/time conflict in {tname}: '{pk}' is both PK and time_column")
+            tconf["primary_key"] = None
+            logger.info(f"  Resolved: {tname} PK set to None (keeping time_column)")
+
+    return schema
 
 
 def _llm_infer_schema(raw_tables: dict) -> dict:
@@ -26,10 +84,10 @@ def _llm_infer_schema(raw_tables: dict) -> dict:
     schema_parts = []
     for name, df in raw_tables.items():
         cols = []
+        total = len(df)
         for col in df.columns:
             dtype = str(df[col].dtype)
             nunique = df[col].nunique()
-            total = len(df)
             samples = [str(v) for v in df[col].dropna().head(3).tolist()]
             cols.append(
                 f"  {col}: dtype={dtype}, unique={nunique}/{total}, samples=[{', '.join(samples)}]"
@@ -43,7 +101,7 @@ def _llm_infer_schema(raw_tables: dict) -> dict:
 {schema_text}
 
 Think step by step:
-1. For each table, find the column with unique={total}/{total} (or near-unique) that serves as the row identifier — this is the primary key. A PK does NOT need "id" in its name; any column with all unique values that logically identifies the entity is valid.
+1. For each table, find the column that uniquely identifies each row (unique count = row count) — this is the primary key. A PK does NOT need "id" in its name; any column with all unique values that logically identifies the entity is valid. If multiple columns are fully unique, prefer the one that is NOT referenced as a foreign key in other tables.
 2. For each table, check if any column has a datetime/timestamp dtype — this is the time column. Set to null if none.
 3. For relationships: find columns that appear in multiple tables. If table A has a non-PK column whose values match table B's primary key, that column is a foreign key from A to B.
 
@@ -62,6 +120,8 @@ Return JSON with this exact structure:
 
 Constraints:
 - The fkey column in a link must NOT be the src_table's own primary key. A PK cannot double as a FK in the same table.
+- If a column is a foreign key referencing another table, it CANNOT also be the primary key of its own table. Choose a different unique column as PK.
+- A primary key CANNOT also be the time column. They must be different columns. If no other unique column exists, set primary_key to null.
 - Links go from child table (src, has the FK) to parent table (dst, has the matching PK).
 - Every transaction/event table should link to its parent entity tables.
 Return ONLY valid JSON, no explanation."""
@@ -76,6 +136,8 @@ Return ONLY valid JSON, no explanation."""
         content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
     result = json.loads(content)
+    result = _resolve_schema_conflicts(result, raw_tables)
+
     for tname, tconf in result.get("tables", {}).items():
         logger.info(f"  LLM schema: {tname} -> pk={tconf.get('primary_key')}, time={tconf.get('time_column')}")
     for link in result.get("links", []):
@@ -83,8 +145,8 @@ Return ONLY valid JSON, no explanation."""
     return result
 
 
-def _summarize_table(name: str, df, schema_info: dict) -> dict[str, Any]:
-    """Create a rich summary of a DataFrame using LLM-inferred schema info."""
+def _summarize_table(name: str, df, schema_info: dict, semantic_types: dict[str, str] | None = None) -> dict[str, Any]:
+    """Create a rich summary of a DataFrame using LLM-inferred schema info and KumoRFM semantic types."""
     table_conf = schema_info.get("tables", {}).get(name, {})
     primary_key = table_conf.get("primary_key")
     time_column = table_conf.get("time_column")
@@ -111,6 +173,8 @@ def _summarize_table(name: str, df, schema_info: dict) -> dict[str, Any]:
             role = "categorical"
 
         col_info = {"dtype": dtype, "role": role, "nunique": int(df[col].nunique())}
+        if semantic_types and col in semantic_types:
+            col_info["semantic_type"] = semantic_types[col]
         if col in fk_map:
             col_info["references"] = f"{fk_map[col]}.{col}"
         if any(t in dtype.lower() for t in ("int", "float")):
@@ -142,17 +206,16 @@ def _summarize_table(name: str, df, schema_info: dict) -> dict[str, Any]:
     }
 
 
-def discover_schema(state: dict) -> dict:
+def inspect_tables(state: dict) -> dict:
     """
-    Node function: Discover schema from data and build KumoRFM graph.
-    Uses LLM to infer PKs, time columns, and FK links.
-    Falls back to auto-detection if LLM inference fails.
+    Node function: Load data and infer relational schema via LLM.
+    Does NOT build the graph — that happens after PQL query generation.
 
-    Reads from state: question, data_path, table_names
-    Writes to state: tables, graph_schema, graph_built
+    Reads from state: data_path, table_names
+    Writes to state: tables, raw_tables, llm_schema, tables_loaded
     """
     data_path = state["data_path"]
-    logger.info(f"Discovering schema from: {data_path}")
+    logger.info(f"Inspecting tables from: {data_path}")
     ensure_init()
 
     s3_table_names = state.get("table_names")
@@ -160,41 +223,41 @@ def discover_schema(state: dict) -> dict:
     if not raw_tables:
         return {
             "tables": {},
-            "graph_built": False,
+            "raw_tables": {},
+            "tables_loaded": False,
             "errors": [f"No tables found at {data_path}"],
-            "current_step": "schema_discovery_failed",
+            "current_step": "table_inspection_failed",
         }
 
     try:
         schema_info = _llm_infer_schema(raw_tables)
-        graph = build_graph_with_schema(raw_tables, schema_info)
-        logger.info("Graph built with LLM-inferred schema")
+        logger.info("Schema inferred via LLM")
     except Exception as e:
-        logger.warning(f"LLM schema inference failed, using auto-detection: {e}")
+        logger.warning(f"LLM schema inference failed: {e}")
         schema_info = {"tables": {}, "links": []}
-        graph = build_graph(raw_tables)
+
+    all_semantic_types = {}
+    table_configs = schema_info.get("tables", {})
+    for tname, df in raw_tables.items():
+        tconf = table_configs.get(tname, {})
+        stypes = get_semantic_types(df, tname, primary_key=tconf.get("primary_key"), time_column=tconf.get("time_column"))
+        all_semantic_types[tname] = stypes
+        logger.info(f"  Semantic types for {tname}: {stypes}")
 
     table_summaries = {
-        name: _summarize_table(name, df, schema_info)
+        name: _summarize_table(name, df, schema_info, semantic_types=all_semantic_types.get(name))
         for name, df in raw_tables.items()
-    }
-    graph_info = get_graph_info(list(raw_tables.keys()))
-
-    schema = {
-        "tables": table_summaries,
-        "relationships": graph_info,
-        "graph_object": graph,
     }
 
     logger.info(
-        f"Schema discovered: {len(raw_tables)} tables, "
+        f"Tables inspected: {len(raw_tables)} tables, "
         f"{sum(len(df) for df in raw_tables.values())} total rows"
     )
 
     return {
         "tables": table_summaries,
-        "graph_schema": schema,
-        "graph_built": True,
+        "raw_tables": raw_tables,
         "llm_schema": schema_info,
-        "current_step": "schema_discovered",
+        "tables_loaded": True,
+        "current_step": "tables_inspected",
     }

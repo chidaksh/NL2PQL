@@ -8,7 +8,6 @@ logger = logging.getLogger(__name__)
 
 VALID_AGGREGATIONS = {"SUM", "COUNT", "AVG", "MAX", "MIN", "COUNT_DISTINCT", "LIST_DISTINCT", "FIRST"}
 NUMERIC_ONLY_AGGS = {"SUM", "AVG", "MAX", "MIN"}
-NUMERIC_TYPES = {"int64", "int32", "float64", "float32", "int", "float", "numeric"}
 
 
 def validate_pql(query: str, schema: dict[str, Any]) -> tuple[bool, list[str]]:
@@ -57,6 +56,9 @@ def validate_pql(query: str, schema: dict[str, Any]) -> tuple[bool, list[str]]:
     if re.search(r"\bFOR\s+EACH\b", q, re.IGNORECASE):
         errors.append("FOR EACH is enterprise-only. Use 'FOR table.id = value' or 'FOR table.id IN (values)'")
 
+    if re.search(r"\bSELECT\b", q, re.IGNORECASE):
+        errors.append("SQL subqueries (SELECT) are not supported in PQL. Entity IDs must be literal values.")
+
     tables_in_schema = schema.get("tables", {})
     table_names = set(tables_in_schema.keys())
 
@@ -86,16 +88,27 @@ def validate_pql(query: str, schema: dict[str, Any]) -> tuple[bool, list[str]]:
         if agg_name not in VALID_AGGREGATIONS:
             errors.append(f"Unknown aggregation '{agg_name}'. Valid: {sorted(VALID_AGGREGATIONS)}")
 
-        if agg_name in NUMERIC_ONLY_AGGS:
-            inner = re.search(rf"{agg_name}\s*\((\w+)\.(\w+)", q, re.IGNORECASE)
-            if inner:
-                t, c = inner.group(1), inner.group(2)
-                if c != "*" and t in tables_in_schema:
-                    col_info = tables_in_schema[t].get("columns", {})
-                    if isinstance(col_info, dict) and c in col_info:
-                        dtype = col_info[c].get("dtype", "").lower()
-                        if dtype and not any(nt in dtype for nt in ("int", "float", "numeric", "double")):
-                            errors.append(f"{agg_name} requires a numeric column, but '{t}.{c}' has type '{dtype}'")
+        inner = re.search(rf"{agg_name}\s*\((\w+)\.(\w+)", q, re.IGNORECASE)
+        agg_table, agg_col = (inner.group(1), inner.group(2)) if inner else (None, None)
+
+        if agg_table and agg_col and agg_col != "*" and agg_table in tables_in_schema:
+            col_info = tables_in_schema[agg_table].get("columns", {})
+            if isinstance(col_info, dict) and agg_col in col_info:
+                col_meta = col_info[agg_col]
+                dtype = col_meta.get("dtype", "").lower()
+                stype = col_meta.get("semantic_type", "").lower()
+                role = col_meta.get("role", "")
+
+                if agg_name in NUMERIC_ONLY_AGGS:
+                    if dtype and not any(nt in dtype for nt in ("int", "float", "numeric", "double")):
+                        errors.append(f"{agg_name} requires a numeric column, but '{agg_table}.{agg_col}' has type '{dtype}'")
+
+                is_id = stype == "id" or role in ("primary_key", "foreign_key")
+                if is_id and not (agg_name == "LIST_DISTINCT" and role == "foreign_key"):
+                    errors.append(
+                        f"{agg_name} cannot be used on ID column '{agg_table}.{agg_col}'. "
+                        f"Use COUNT({agg_table}.*, ...) for counting rows."
+                    )
 
         if agg_name == "LIST_DISTINCT":
             if not re.search(r"RANK\s+TOP\s+\d+", q, re.IGNORECASE):

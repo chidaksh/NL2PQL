@@ -44,7 +44,10 @@ def _build_schema_description(tables: dict[str, Any]) -> str:
             dtype = ci.get("dtype", "?")
             role = ci.get("role", "?")
             ref = ci.get("references", "")
+            stype = ci.get("semantic_type", "")
             line = f"  {col}: {dtype} ({role})"
+            if stype:
+                line += f" [stype={stype}]"
             if ref:
                 line += f" -> {ref}"
             if "min" in ci:
@@ -64,6 +67,18 @@ def _build_schema_description(tables: dict[str, Any]) -> str:
             parts.append(f"  Sample rows: {json.dumps(sample_rows[:2], default=str)}")
         parts.append("")
 
+    connectivity = []
+    for name, info in tables.items():
+        for ref in info.get("foreign_key_references", []):
+            if "." in ref:
+                dst = ref.split(".")[0]
+                fk = ref.split(".", 1)[1]
+                connectivity.append(f"  {name} -> {dst} (via {name}.{fk})")
+    if connectivity:
+        parts.append("=== FK Connectivity (target tables must be reachable from entity tables) ===")
+        parts.extend(connectivity)
+        parts.append("")
+
     return "\n".join(parts)
 
 
@@ -71,7 +86,7 @@ def _build_system_prompt(pql_ref: str, rag_examples: str) -> str:
     """Build the system prompt with PQL reference and RAG examples."""
     return f"""You are a predictive analytics expert working with KumoRFM, a Relational Foundation Model.
 
-Your job: Given a business question and a database schema, generate 4-6 testable prediction hypotheses.
+Your job: Given a business question and a database schema, generate required testable prediction hypotheses. If needed generate more than one hypothesis to analyze the business question else stick to one query.
 Each hypothesis must be answerable by a PQL query against the given schema.
 
 === PQL REFERENCE ===
@@ -89,14 +104,23 @@ Each hypothesis must be answerable by a PQL query against the given schema.
 6. LIST_DISTINCT requires RANK TOP k
 7. SUM/AVG/MAX/MIN only work on numeric columns
 8. ALL hypotheses must directly address the business question. Do NOT include unrelated prediction types (e.g. no churn queries if the question is about product promotion).
-9. HYPOTHESIS DIVERSITY — this is critical:
+9. HYPOTHESIS DIVERSITY is critical if you generating multiple hypotheses:
    - If the question specifies a time window (e.g. "next 30 days"), use THAT time window for most hypotheses. Do NOT generate 5 queries that are identical except for the time window.
-   - Instead, explore DIFFERENT ANGLES: different metrics (SUM vs COUNT vs AVG), different aggregation targets, complementary analyses (e.g. revenue + order count + average order value).
-   - Only vary time windows when the question is vague/analytical (e.g. "How is my business doing?") or when comparing short vs long term is explicitly needed.
+   - Instead, explore DIFFERENT ANGLES and ANALYSIS: different metrics, different aggregation targets, complementary analyses (e.g. revenue + order count + average order value).
    - Each hypothesis should provide UNIQUE insight, not a trivially different version of the same query.
 10. Prefer single-entity predictions (FOR table.id=value) over multi-entity (FOR table.id IN (...)) because explain works only for single entities. Use IN only when comparing multiple entities is essential.
 11. Never use IN with a single value — use = instead (e.g. FOR users.user_id=0, NOT FOR users.user_id IN (0))
 12. Use ONLY PREDICT queries. Do NOT use EVALUATE PREDICT — the SDK does not support this combination.
+13. TARGET-ENTITY CONNECTIVITY: The table in PREDICT must be reachable from the table in FOR
+    via foreign key relationships (direct or through intermediate tables). The system handles
+    denormalization for multi-hop links automatically — just ensure a FK path exists between them.
+14. For each hypothesis, include "entity_table" (table in FOR clause) and "target_table" (table in PREDICT clause).
+15. PQL does NOT support SQL subqueries, JOINs, or expressions. Entity IDs in the FOR clause must be LITERAL values from sample_ids. Never use (SELECT ...) or any SQL syntax.
+16. AGGREGATION-COLUMN COMPATIBILITY (based on KumoRFM semantic types shown as stype= in schema):
+    - SUM/AVG/MAX/MIN: only on stype=numerical columns
+    - COUNT_DISTINCT: only on stype=categorical (NEVER on stype=ID — these are PK/FK columns)
+    - LIST_DISTINCT: only on stype=categorical or stype=ID foreign keys (with RANK TOP k)
+    - COUNT: works on any column (counts rows)
 
 === OUTPUT FORMAT (strict JSON) ===
 {{
@@ -105,7 +129,9 @@ Each hypothesis must be answerable by a PQL query against the given schema.
       "hypothesis": "Natural language description",
       "pql_query": "The exact PQL query",
       "rationale": "Why this matters for the business question",
-      "prediction_type": "churn|forecast|recommendation|imputation|classification"
+      "prediction_type": "churn|forecast|recommendation|imputation|classification",
+      "entity_table": "table name from FOR clause",
+      "target_table": "table name from PREDICT clause"
     }}
   ]
 }}

@@ -33,7 +33,11 @@ def _load_kb() -> list[dict[str, Any]]:
     global _kb_cache
     if _kb_cache is None:
         with open(_KB_PATH) as f:
-            _kb_cache = json.load(f)
+            data = json.load(f)
+        if isinstance(data, dict) and "examples" in data:
+            _kb_cache = data["examples"]
+        else:
+            _kb_cache = data
     return _kb_cache
 
 

@@ -115,8 +115,9 @@ if run_clicked:
         progress_bar = st.progress(0, text="Starting pipeline...")
 
         steps = [
-            ("Schema Discovery", "Inspecting tables and building relational graph..."),
+            ("Table Inspection", "Inspecting tables and inferring schema..."),
             ("Hypothesis Generation", "Generating prediction hypotheses..."),
+            ("Graph Building", "Building query-driven relational graph..."),
             ("Prediction Execution", "Running PQL queries via KumoRFM..."),
             ("Strategy Synthesis", "Producing actionable strategy report..."),
         ]
@@ -131,10 +132,12 @@ if run_clicked:
             "table_names": table_names,
             "anchor_time": anchor_time,
             "tables": {},
+            "raw_tables": {},
+            "llm_schema": {},
+            "tables_loaded": False,
+            "hypotheses": [],
             "graph_schema": {},
             "graph_built": False,
-            "llm_schema": {},
-            "hypotheses": [],
             "predictions": [],
             "strategy_report": "",
             "confidence_score": 0.0,
@@ -154,17 +157,20 @@ if run_clicked:
                     step_timings[node_name] = elapsed
                     step_start = time.time()
 
-                    if node_name == "discover_schema":
+                    if node_name == "inspect_tables":
                         step_idx = 0
-                        progress_bar.progress(25, text=f"Schema discovered ({elapsed:.1f}s)")
+                        progress_bar.progress(20, text=f"Tables inspected ({elapsed:.1f}s)")
                     elif node_name == "generate_hypotheses":
                         step_idx = 1
-                        progress_bar.progress(50, text=f"Hypotheses generated ({elapsed:.1f}s)")
-                    elif node_name == "execute_predictions":
+                        progress_bar.progress(40, text=f"Hypotheses generated ({elapsed:.1f}s)")
+                    elif node_name == "build_query_graph":
                         step_idx = 2
-                        progress_bar.progress(75, text=f"Predictions executed ({elapsed:.1f}s)")
-                    elif node_name == "synthesize_strategy":
+                        progress_bar.progress(60, text=f"Graph built ({elapsed:.1f}s)")
+                    elif node_name == "execute_predictions":
                         step_idx = 3
+                        progress_bar.progress(80, text=f"Predictions executed ({elapsed:.1f}s)")
+                    elif node_name == "synthesize_strategy":
+                        step_idx = 4
                         progress_bar.progress(100, text="Strategy complete")
 
                     if step_idx < len(steps):

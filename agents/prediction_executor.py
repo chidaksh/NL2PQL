@@ -8,13 +8,13 @@ Retries failed queries once by asking the LLM to fix them based on the error.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import kumoai.experimental.rfm as rfm
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from tools.kumo_tools import run_prediction
 from tools.llm import get_llm
+from tools.pql_validator import validate_pql
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +29,19 @@ def _ask_llm_to_fix(pql: str, error: str, schema_desc: str) -> str | None:
             "You fix broken PQL (Predictive Query Language) queries. Return ONLY the corrected query.\n\n"
             "PQL syntax: PREDICT AGG(table.column, start, end[, days]) FOR entity_table.pk=value\n"
             "Supported AGGs: SUM, COUNT, AVG, MAX, MIN, COUNT_DISTINCT, LIST_DISTINCT, FIRST\n"
-            "FOR clause: must use the table's primary key column (check the schema)\n"
+            "FOR clause: must use the table's primary key column with a literal value\n"
             "LIST_DISTINCT requires RANK TOP k\n"
-            "Optional: WHERE table.column operator value\n\n"
+            "Optional: WHERE AGG(table.column, start, end) operator value\n\n"
+            "AGGREGATION-COLUMN RULES (API rejects violations):\n"
+            "- SUM/AVG/MAX/MIN: only on numerical columns\n"
+            "- COUNT: use COUNT(table.*, ...) with wildcard only — never COUNT(table.id_column)\n"
+            "- COUNT_DISTINCT: only on categorical columns, NEVER on ID/PK/FK columns\n"
+            "- LIST_DISTINCT: only on FK or categorical columns\n"
+            "- No aggregation on ID columns (PK or FK) except LIST_DISTINCT on FK\n\n"
             "PQL does NOT support: GROUP BY, ORDER BY, HAVING, LIMIT, subqueries (SELECT...FROM), "
-            "or EVALUATE PREDICT (use PREDICT only). Do NOT add any unsupported clauses."
+            "or EVALUATE PREDICT. Entity IDs must be literal values, never expressions."
         )),
-        HumanMessage(content=f"Broken query: {pql}\nError: {error}\n\nSchema (table pk: columns):\n{schema_desc}\n\nReturn ONLY the fixed PQL query:"),
+        HumanMessage(content=f"Broken query: {pql}\nError: {error}\n\nSchema (table pk [stype]: columns):\n{schema_desc}\n\nReturn ONLY the fixed PQL query:"),
     ])
     fixed = response.content.strip()
     if fixed.startswith("```"):
@@ -44,13 +50,29 @@ def _ask_llm_to_fix(pql: str, error: str, schema_desc: str) -> str | None:
 
 
 def _build_brief_schema(tables: dict) -> str:
-    """Build a brief schema string for error-fix prompts."""
+    """Build a brief schema string with stype info for error-fix prompts."""
     parts = []
     for name, info in tables.items():
         cols = info.get("columns", {})
         pk = info.get("primary_key", "?")
-        col_names = list(cols.keys()) if isinstance(cols, dict) else cols
-        parts.append(f"{name} (pk={pk}): {', '.join(col_names)}")
+        stype = info.get("semantic_type", "")
+        header = f"{name} (pk={pk}"
+        if stype:
+            header += f", stype={stype}"
+        header += ")"
+
+        col_parts = []
+        if isinstance(cols, dict):
+            for col, meta in cols.items():
+                if isinstance(meta, dict):
+                    st = meta.get("semantic_type", "")
+                    col_parts.append(f"{col}[{st}]" if st else col)
+                else:
+                    col_parts.append(col)
+        else:
+            col_parts = list(cols)
+
+        parts.append(f"{header}: {', '.join(col_parts)}")
     return "\n".join(parts)
 
 
@@ -95,9 +117,14 @@ def execute_predictions(state: dict) -> dict:
             logger.info(f"  H{i+1} failed, asking LLM to fix: {result['error']}")
             fixed_pql = _ask_llm_to_fix(pql, result["error"], schema_desc)
             if fixed_pql and fixed_pql != pql:
-                logger.info(f"  Retrying H{i+1}: {fixed_pql}")
-                result = run_prediction(model, fixed_pql, explain=True, anchor_time=anchor_time)
-                result["retried_query"] = fixed_pql
+                is_valid, val_errors = validate_pql(fixed_pql, {"tables": tables})
+                if not is_valid:
+                    logger.warning(f"  H{i+1} LLM fix failed validation: {val_errors}")
+                    result["fix_validation_errors"] = val_errors
+                else:
+                    logger.info(f"  Retrying H{i+1}: {fixed_pql}")
+                    result = run_prediction(model, fixed_pql, explain=True, anchor_time=anchor_time)
+                    result["retried_query"] = fixed_pql
 
         result["query"] = pql
         result["hypothesis"] = hyp.get("hypothesis", f"Hypothesis {i+1}")

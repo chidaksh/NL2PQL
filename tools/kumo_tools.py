@@ -58,6 +58,23 @@ def load_tables(
 
     return tables
 
+def get_semantic_types(
+    df: pd.DataFrame,
+    name: str,
+    primary_key: str | None = None,
+    time_column: str | None = None,
+) -> dict[str, str]:
+    """Extract KumoRFM semantic types (ID, categorical, numerical, timestamp) for each column."""
+    ensure_init()
+    kwargs = {"name": name}
+    if primary_key and primary_key in df.columns:
+        kwargs["primary_key"] = primary_key
+    if time_column and time_column in df.columns:
+        kwargs["time_column"] = time_column
+    lt = rfm.LocalTable(df, **kwargs)
+    return {col.name: str(col.stype) for col in lt.columns}
+
+
 def build_graph(tables: dict[str, pd.DataFrame]) -> rfm.LocalGraph:
     """Build a KumoRFM LocalGraph from DataFrames (auto-detection fallback)."""
     ensure_init()

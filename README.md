@@ -6,10 +6,11 @@ An autonomous business intelligence system that converts natural language questi
 
 Given a business question and a relational dataset (local or S3), PredictiveAgent:
 
-1. **Schema Discovery** -- loads tables, infers primary/foreign keys, time columns, and entity/event classification automatically.
-2. **Hypothesis Generation** -- uses RAG retrieval from a PQL knowledge base, the full PQL reference, and static validation with retry to generate 4-6 diverse PQL queries. If the question specifies a time window, hypotheses explore different angles (SUM, AVG, COUNT, MAX) rather than repeating the same metric across time windows.
-3. **Prediction Execution** -- runs each PQL query via KumoRFM with `explain=True` for native model explanations. Multi-entity queries are automatically decomposed: bulk predict without explain, then individual explain calls for the top entities. Failed queries are retried once after LLM-based fix. Supports optional `anchor_time` for historical predictions.
-4. **Strategy Synthesis** -- pre-computes data statistics (prediction value summaries, model explanation factors, data quality metrics) and feeds them to an LLM to produce a data-driven strategy report with executive summary, key findings, data-backed recommended actions, and risk assessment.
+1. **Table Inspection** -- loads tables, infers primary/foreign keys, time columns, and entity/event classification via LLM. Extracts KumoRFM semantic types (`ID`, `categorical`, `numerical`, `timestamp`) per column to guide downstream aggregation choices.
+2. **Hypothesis Generation** -- uses RAG retrieval from a PQL knowledge base, the full PQL reference, semantic type annotations, and static validation with retry to generate 4-6 diverse PQL queries. Aggregation-column compatibility rules prevent invalid combinations (e.g. COUNT_DISTINCT on ID columns).
+3. **Graph Building** -- analyzes generated PQL queries to determine required entity-target links, performs denormalization (copies FKs through intermediate tables) when the target is >1 hop from the entity, then builds the KumoRFM graph.
+4. **Prediction Execution** -- runs each PQL query via KumoRFM with `explain=True` for native model explanations. Multi-entity queries are automatically decomposed: bulk predict without explain, then individual explain calls for the top entities. Failed queries are retried once after LLM-based fix. Supports optional `anchor_time` for historical predictions.
+5. **Strategy Synthesis** -- pre-computes data statistics (prediction value summaries, model explanation factors, data quality metrics) and feeds them to an LLM to produce a data-driven strategy report with executive summary, key findings, data-backed recommended actions, and risk assessment.
 
 ## Installation
 
@@ -88,15 +89,16 @@ python main.py --question "Predict the transaction volume (count of transactions
 kumo/
 ├── main.py                       # CLI entry point
 ├── agents/
-│   ├── graph.py                  # LangGraph orchestration (4-node pipeline)
-│   ├── schema_discovery.py       # Table loading, PK/FK inference, graph building
-│   ├── hypothesis_generator.py   # RAG + PQL reference + LLM + static validation
+│   ├── graph.py                  # LangGraph orchestration (5-node pipeline)
+│   ├── schema_discovery.py       # Table loading, PK/FK inference, semantic type extraction
+│   ├── hypothesis_generator.py   # RAG + PQL reference + semantic types + LLM + static validation
+│   ├── graph_builder.py          # Query-driven graph construction with denormalization
 │   ├── prediction_executor.py    # KumoRFM predict with explain + multi-entity decomposition + LLM retry
 │   └── strategy_synthesizer.py   # Data-driven strategy report (pre-computed stats + LLM)
 ├── tools/
 │   ├── llm.py                    # Centralized LLM initialization (gpt-4o-mini)
-│   ├── kumo_tools.py             # KumoRFM SDK wrappers
-│   ├── pql_validator.py          # Static PQL syntax/semantic validator
+│   ├── kumo_tools.py             # KumoRFM SDK wrappers + semantic type extraction
+│   ├── pql_validator.py          # Static PQL syntax/semantic validator (incl. stype checks)
 │   └── pql_knowledge_base.py     # RAG retrieval over 33 PQL examples
 ├── ui/
 │   └── app.py                    # Streamlit interface
@@ -118,13 +120,13 @@ kumo/
 
 1. **KumoRFM SDK** -- the `kumoai` package is installed and `KUMO_API_KEY` is valid. The graph is built with explicit `LocalTable` objects and `graph.link()` calls based on LLM-inferred schema.
 2. **OpenAI API** -- `gpt-4o-mini` is used for all LLM calls (schema inference, hypothesis generation, query fixing, strategy synthesis). No Anthropic fallback.
-3. **Schema inference** -- an LLM analyzes column names, dtypes, uniqueness counts, and sample values to determine primary keys, time columns, and foreign key links. Falls back to `rfm.LocalGraph.from_data()` auto-detection if LLM inference fails. PKs do not need "id" in the name (e.g. `cc_num`, `merchant`, `trans_num` are valid).
-4. **Graph links** -- FK relationships are inferred by the LLM and validated: a FK column cannot be the source table's own PK. Links are created via `graph.link(src_table, fkey, dst_table)`.
+3. **Schema inference** -- an LLM analyzes column names, dtypes, uniqueness counts, and sample values to determine primary keys, time columns, and foreign key links. PKs do not need "id" in the name (e.g. `cc_num`, `merchant`, `trans_num` are valid). KumoRFM semantic types (`ID`, `categorical`, `numerical`, `timestamp`) are extracted via `rfm.LocalTable` and propagated to guide aggregation choices.
+4. **Graph building** -- the graph is built AFTER PQL queries are generated (query-first approach). FK relationships are inferred by the LLM and validated. When a PQL target table is >1 hop from the entity table, denormalization copies the entity FK through intermediate tables to create a direct link. Links are created via `graph.link(src_table, fkey, dst_table)`.
 5. **Time column inference** -- determined by the LLM based on datetime/timestamp dtypes and column semantics.
 6. **Event vs entity tables** -- a table is classified as an event table if it has both a time column and at least one foreign key reference. Otherwise it is an entity table.
 7. **S3 datasets** -- `--tables` is required for custom S3 paths (no S3 listing). Files are assumed to be `.parquet`. Only the default online-shopping dataset auto-defaults to `[users, items, orders]`.
 8. **Local datasets** -- all `.parquet` and `.csv` files in the given directory are loaded. Filename (without extension) becomes the table name.
-9. **PQL validation** -- the static validator checks table/column existence, aggregation types, numeric constraints, PK usage in FOR clauses, and time window bounds. It does not validate WHERE clause column values.
+9. **PQL validation** -- the static validator checks table/column existence, aggregation types, numeric constraints, PK usage in FOR clauses, time window bounds, and aggregation-stype compatibility (e.g. COUNT_DISTINCT rejected on ID columns). It does not validate WHERE clause column values.
 10. **explain=True** -- KumoRFM's explain only works for single-entity predictions. For multi-entity queries (`FOR x.id IN (...)`), the system automatically decomposes: runs bulk prediction without explain, then explains the top 3 most interesting entities individually.
 11. **Prediction retry** -- if a PQL query fails at execution, the LLM is asked to fix it once based on the error message. If the fix also fails, the prediction is marked as failed.
 12. **Confidence score** -- computed as the ratio of successful predictions to total predictions. Not a statistical confidence interval.

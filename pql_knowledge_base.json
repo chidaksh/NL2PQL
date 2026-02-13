@@ -943,7 +943,6 @@
       "uses_evaluate": false,
       "for_style": "for_each",
       "rfm_compatible": false,
-      "rfm_equivalent": "PREDICT SUM(WEB_SALES_MINI.WS_EXT_SALES_PRICE, 0, 30) FOR CUSTOMERS_MINI.C_CUSTOMER_SK = <value>",
       "dataset": "snowflake_tpcds",
       "dataset_url": null,
       "dataset_tables": {

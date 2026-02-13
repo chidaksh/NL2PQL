@@ -30,13 +30,8 @@ st.markdown("""
 with st.sidebar:
     st.markdown("### Configuration")
 
-    kumo_key = st.text_input("KumoRFM API Key", value=os.environ.get("KUMO_API_KEY", ""), type="password")
-    if kumo_key:
-        os.environ["KUMO_API_KEY"] = kumo_key
-
-    llm_key = st.text_input("OpenAI API Key", value=os.environ.get("OPENAI_API_KEY", ""), type="password")
-    if llm_key:
-        os.environ["OPENAI_API_KEY"] = llm_key
+    st.text_input("KumoRFM API Key", type="password", key="kumo_api_key")
+    st.text_input("OpenAI API Key", type="password", key="openai_api_key")
 
     st.markdown("---")
 
@@ -104,12 +99,15 @@ if clear_col.button("Clear Results", use_container_width=True):
 if run_clicked:
     if not question.strip():
         st.error("Please enter a business question.")
-    elif not os.environ.get("KUMO_API_KEY"):
+    elif not st.session_state.get("kumo_api_key"):
         st.error("Please set your KumoRFM API key in the sidebar.")
-    elif not os.environ.get("OPENAI_API_KEY"):
+    elif not st.session_state.get("openai_api_key"):
         st.error("Please set your OpenAI API key in the sidebar.")
     else:
         st.session_state.pop("results", None)
+
+        os.environ["KUMO_API_KEY"] = st.session_state["kumo_api_key"]
+        os.environ["OPENAI_API_KEY"] = st.session_state["openai_api_key"]
 
         status_container = st.status("Running pipeline...", expanded=True)
         progress_bar = st.progress(0, text="Starting pipeline...")

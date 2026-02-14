@@ -2,6 +2,8 @@
 
 An autonomous business intelligence system that converts natural language questions into KumoRFM predictions and delivers actionable strategy reports. Unlike existing KumoRFM cookbooks that hardcode single-task PQL queries, PredictiveAgent discovers schemas, generates PQL autonomously, executes predictions with native explanations, and synthesizes results into a strategy report -- all without human intervention.
 
+## Demo
+[![Watch the video](https://img.youtube.com/vi/yv038oCF1Vo/maxresdefault.jpg)](https://youtu.be/yv038oCF1Vo)
 ## What It Does
 
 Given a business question and a relational dataset (local or S3), PredictiveAgent:
